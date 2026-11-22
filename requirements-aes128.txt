@@ -1,0 +1,3 @@
+-r requirements.txt
+# Optional if `openssl` is already available on the host.
+cryptography>=42

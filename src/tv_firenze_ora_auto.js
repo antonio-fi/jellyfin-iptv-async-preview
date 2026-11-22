@@ -1,25 +1,26 @@
-/* Experimental Jellyfin 10.11.11 Live TV / On Now previews.
- * Acquisizione indipendente su 8099; mouse = sola visualizzazione del buffer.
- * Non modifica il filtro dei preferiti, le API o il lettore Jellyfin.
+/* ZAPPING PUSH: il client invia i Preferiti all'apertura del WebSocket.
+ * I fotogrammi JPEG vengono ricevuti spontaneamente, senza /state o /frame.
+ * Non modifica i Preferiti, la playlist o il lettore Jellyfin.
  */
 (() => {
   'use strict';
   if (window.__tvFirenzeOraAuto) return;
   window.__tvFirenzeOraAuto = true;
 
-  // Configure a reverse proxy for HTTPS Jellyfin deployments.
-  // The service listens on port 8099 on the same hostname by default.
-  const previewBase = window.jellyfinPreviewBase || (location.protocol + '//' + location.hostname + ':8099');
+  // Override these globals before loading the script for non-default/proxy deployments.
+  const managerBase = window.jellyfinZappingManagerBase ||
+    (location.protocol + '//' + location.hostname + ':8100');
+  const previewSocket = window.jellyfinZappingSocket ||
+    ((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.hostname + ':8099/ws');
+  const clientId = (window.crypto && crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + '-' + Math.random().toString(36).slice(2));
   const cardSelectors = '.card, .listItem';
   const channelSelectors = '[data-channelid]';
   const state = {
-    channelNames: new Map(), cards: new Map(), frameVersions: new Map(),
-    displayedVersions: new Map(), pendingImages: new Set(),
-    focusedId: '', hoverTimer: null, running: false,
-    lastHeartbeat: 0, lastScan: 0, lastPoll: 0,
-    lastNames: '', busy: false, lastFocusSent: '', namesPromise: null, lastNameAttempt: 0,
-    displayedCount: 0, serverFrameCount: null, serverSamples: [],
-    lastStatus: 0, ledTimer: null, led: null, ledCount: null, ledRate: null, ledDisplayed: null, ledNetwork: null, ledCache: null, ledHealth: null
+    channelNames: new Map(), cards: new Map(), favoriteNames: new Set(),
+    latestFrames: new Map(),
+    socket: null, socketNames: '', namesReady: false,
+    namesPromise: null, lastNameAttempt: 0, lastReconnect: 0,
+    led: null, ledTimer: null, running: false
   };
 
   function isLiveNowPage() {
@@ -38,8 +39,19 @@
     return !match || Number(match[1]) === 0;
   }
 
-  // Diagnostica: aggiornamenti rilevati dallo stato del server, non dal caricamento DOM.
-  // Un cambiamento di versione per canale = almeno un nuovo JPEG disponibile.
+  function setLed(color) {
+    if (state.led) {
+      state.led.style.background = color;
+      state.led.style.boxShadow = 'none';
+    }
+  }
+
+  function blink() {
+    setLed('#e5e5e5');
+    clearTimeout(state.ledTimer);
+    state.ledTimer = setTimeout(() => setLed('#777'), 260);
+  }
+
   function ensureFrameIndicator() {
     const header = document.querySelector('.skinHeader');
     if (!header) return;
@@ -48,16 +60,15 @@
       led = document.createElement('div');
       led.id = 'tvf-frame-led';
       led.setAttribute('role', 'status');
-      led.title = 'Il LED lampeggia quando il server riceve nuove risposte HTTP complete dalle sorgenti IPTV. Frequenza rilevata negli ultimi 10 secondi.';
-      led.style.cssText = 'display:flex;align-items:center;gap:7px;white-space:nowrap;padding:5px 10px;border-radius:15px;background:rgba(12,15,20,.78);border:1px solid rgba(255,255,255,.24);color:#fff;font:600 12px Arial,sans-serif;pointer-events:none;';
-      led.innerHTML = '<span class="tvf-led-light" style="width:9px;height:9px;border-radius:50%;background:#666;display:inline-block;flex:none;transition:background .12s,box-shadow .12s;"></span><span>RISPOSTE IPTV</span><span class="tvf-led-rate">0/10s</span><span class="tvf-led-health" style="opacity:.9"></span>';
+      led.title = 'ZAPPING: fotogrammi ricevuti e comandi';
+      led.style.cssText = 'display:flex;align-items:center;gap:5px;white-space:nowrap;padding:3px 7px;border-radius:12px;background:rgba(12,15,20,.78);border:1px solid rgba(255,255,255,.18);color:#fff;font:500 11px Arial,sans-serif;pointer-events:auto;';
+      led.innerHTML = '<span class="tvf-led-light" style="width:6px;height:6px;border-radius:50%;background:#777;display:inline-block;flex:none;"></span><span>ZAPPING</span>';
     }
     const headerRight = header.querySelector('.headerRight');
     if (headerRight) {
       if (led.parentElement !== headerRight) {
         led.style.position = 'static';
-        led.style.transform = 'none';
-        led.style.margin = '0 12px 0 4px';
+        led.style.margin = '0 8px 0 4px';
         headerRight.prepend(led);
       }
     } else if (led.parentElement !== header) {
@@ -66,73 +77,70 @@
       led.style.top = '8px';
       led.style.left = '50%';
       led.style.transform = 'translateX(-50%)';
-      led.style.margin = '0';
-      led.style.zIndex = '30';
       header.append(led);
     }
     state.led = led.querySelector('.tvf-led-light');
-    state.ledCount = led.querySelector('.tvf-led-count');
-    state.ledNetwork = led.querySelector('.tvf-led-network');
-    state.ledCache = led.querySelector('.tvf-led-cache');
-    state.ledHealth = led.querySelector('.tvf-led-health');
-    state.ledRate = led.querySelector('.tvf-led-rate');
-    state.ledDisplayed = led.querySelector('.tvf-led-displayed');
     led.style.display = isLiveNowPage() ? 'flex' : 'none';
   }
 
-  // LED e frequenza: misurano esclusivamente le risposte HTTP reali
-  // ricevute dal comunicatore multisessione, non JPEG o cache.
-  async function pollServerStats() {
-    try {
-      const response = await fetch(previewBase + '/status', { mode: 'cors', cache: 'no-store' });
-      if (!response.ok) throw new Error('HTTP ' + response.status);
-      const payload = await response.json();
-      if (!Number.isSafeInteger(payload.http_responses) || payload.http_responses < 0) {
-        throw new Error('Campo http_responses mancante');
-      }
-      if (state.ledHealth) {
-        const errors = Object.keys(payload.errors || {}).length;
-        state.ledHealth.textContent = !payload.active ? ' · INATTIVO' : errors ? ' · ⚠' + errors : '';
-        state.ledHealth.style.color = !payload.active || errors ? '#ffcf71' : '#fff';
-      }
-      const now = Date.now();
-      const count = payload.http_responses;
-      if (state.serverFrameCount === null || count < state.serverFrameCount) {
-        state.serverSamples = [{ now, count }];
-      } else if (count > state.serverFrameCount) {
-        if (state.led) {
-          state.led.style.background = '#40e376';
-          state.led.style.boxShadow = '0 0 8px 2px rgba(64,227,118,.6)';
-          clearTimeout(state.ledTimer);
-          state.ledTimer = setTimeout(() => {
-            if (!state.led) return;
-            state.led.style.background = '#666';
-            state.led.style.boxShadow = 'none';
-          }, 350);
+  function ensureServerMenu() {
+    const led = document.getElementById('tvf-frame-led');
+    if (!led || document.getElementById('tvf-led-controls')) return;
+    const button = document.createElement('button');
+    button.id = 'tvf-led-controls';
+    button.type = 'button';
+    button.textContent = '▾';
+    button.title = 'Comandi ZAPPING';
+    button.style.cssText = 'border:0;background:transparent;color:white;font:700 12px Arial;cursor:pointer;padding:0 2px 0 3px;line-height:1;';
+    const panel = document.createElement('div');
+    panel.id = 'tvf-led-panel';
+    panel.style.cssText = 'display:none;position:fixed;z-index:2147483647;background:#20242b;border:1px solid #777;border-radius:6px;padding:6px;min-width:155px;box-shadow:0 5px 16px #0008;';
+    document.body.appendChild(panel);
+    const positionPanel = () => {
+      const rect = button.getBoundingClientRect();
+      const width = Math.max(170, panel.offsetWidth);
+      panel.style.left = Math.max(8, Math.min(window.innerWidth - width - 8, rect.right - width)) + 'px';
+      panel.style.top = Math.min(window.innerHeight - panel.offsetHeight - 8, rect.bottom + 5) + 'px';
+    };
+    const action = document.createElement('button');
+    action.type = 'button';
+    action.textContent = '↻ Riavvia';
+    action.style.cssText = 'display:block;width:100%;text-align:left;padding:9px;background:transparent;color:white;border:0;cursor:pointer;';
+    action.addEventListener('click', async event => {
+      event.stopPropagation();
+      panel.style.display = 'none';
+      action.disabled = true;
+      try {
+        const response = await fetch(managerBase + '/admin/restart', {
+          method: 'POST', mode: 'cors', cache: 'no-store',
+          headers: {'Content-Type': 'application/json'}, body: '{}'
+        });
+        if (!response.ok) {
+          const detail = await response.json().catch(() => ({}));
+          throw new Error(detail.error || ('HTTP ' + response.status));
         }
-        state.serverSamples.push({ now, count });
+        disconnectClient();
+        state.lastReconnect = 0;
+      } catch (error) {
+        alert('Comando ZAPPING non riuscito: ' + error.message);
+      } finally {
+        action.disabled = false;
       }
-      state.serverFrameCount = count;
-      updateFrameRate();
-    } catch {
-      if (state.ledRate) state.ledRate.textContent = 'offline';
-      if (state.ledHealth) state.ledHealth.textContent = ' · SERVIZIO NON RAGGIUNGIBILE';
-      if (state.led) {
-        state.led.style.background = '#e66';
-        state.led.style.boxShadow = 'none';
-      }
-    }
-  }
-
-  function updateFrameRate() {
-    const now = Date.now();
-    const samples = state.serverSamples;
-    while (samples.length > 1 && samples[1].now < now - 10000) samples.shift();
-    if (state.ledRate && state.serverFrameCount !== null) {
-      const first = samples[0];
-      const delta = first ? Math.max(0, state.serverFrameCount - first.count) : 0;
-      state.ledRate.textContent = String(delta) + '/10s';
-    }
+    });
+    panel.appendChild(action);
+    button.addEventListener('click', event => {
+      event.stopPropagation();
+      const opening = panel.style.display === 'none';
+      panel.style.display = opening ? 'block' : 'none';
+      if (opening) positionPanel();
+    });
+    document.addEventListener('click', event => {
+      if (!led.contains(event.target) && !panel.contains(event.target)) panel.style.display = 'none';
+    });
+    window.addEventListener('resize', () => {
+      if (panel.style.display !== 'none') positionPanel();
+    });
+    led.appendChild(button);
   }
 
   function getChannelId(card) {
@@ -154,79 +162,29 @@
     if (!host) return;
     if (getComputedStyle(host).position === 'static') host.style.position = 'relative';
     let data = state.cards.get(id);
-    if (!data || data.card !== card || !data.badge.isConnected) {
+    if (!data || data.card !== card || data.host !== host || !data.badge.isConnected) {
+      // Jellyfin può sostituire l'intera scheda: il frame rimane nella memoria
+      // per canale e viene ridisegnato subito, senza attendere un nuovo JPEG.
+      if (data?.objectUrl) URL.revokeObjectURL(data.objectUrl);
       const badge = document.createElement('div');
       badge.className = 'tvf-ora-auto-name';
       badge.style.cssText = 'position:absolute;top:0;left:0;z-index:12;max-width:92%;box-sizing:border-box;padding:4px 7px;border-radius:0 0 6px 0;background:rgba(10,12,18,.82);color:white;font:700 12px Arial,sans-serif;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;pointer-events:none;';
       badge.textContent = state.channelNames.get(id) || 'Canale TV';
       host.append(badge);
-      data = { card, host, badge, image: null };
+      data = {card, host, badge, image: null, objectUrl: null};
       state.cards.set(id, data);
-      state.displayedVersions.delete(id);
     } else {
       data.badge.textContent = state.channelNames.get(id) || 'Canale TV';
+      // Può essere sostituito soltanto il contenuto del contenitore immagine.
+      if (data.image && !data.image.isConnected) {
+        if (data.objectUrl) URL.revokeObjectURL(data.objectUrl);
+        data.image = null;
+        data.objectUrl = null;
+      }
     }
-  }
-
-  function showFrame(id, version) {
-    const data = state.cards.get(id);
     const name = state.channelNames.get(id);
-    if (!data?.host?.isConnected || !name || state.pendingImages.has(id)) return;
-    if (state.displayedVersions.get(id) === version) return;
-    state.pendingImages.add(id);
-    const image = new Image();
-    image.onload = () => {
-      state.pendingImages.delete(id);
-      const latest = state.cards.get(id);
-      if (!latest || latest !== data || !latest.host.isConnected || !isLiveNowPage()) return;
-      if (!latest.image) {
-        const overlay = document.createElement('div');
-        overlay.className = 'tvf-ora-auto-frame';
-        overlay.style.cssText = 'position:absolute;inset:0;z-index:6;pointer-events:none;background:#08090c;display:flex;align-items:center;justify-content:center;overflow:hidden;';
-        const displayed = document.createElement('img');
-        displayed.alt = 'Fotogramma della diretta';
-        displayed.style.cssText = 'width:100%;height:100%;object-fit:contain;display:block;';
-        overlay.append(displayed);
-        latest.host.insertBefore(overlay, latest.badge);
-        latest.image = displayed;
-      }
-      latest.image.src = image.src;
-      if (state.displayedVersions.get(id) !== version) {
-        state.displayedCount++;
-
-      }
-      state.displayedVersions.set(id, version);
-    };
-    image.onerror = () => state.pendingImages.delete(id);
-    image.src = previewBase + '/frame?name=' + encodeURIComponent(name) + '&v=' + version;
-  }
-
-  // La richiesta dei nomi NON deve bloccare la prima scansione del DOM,
-  // le statistiche o il caricamento della pagina di Jellyfin.
-  function refreshChannelNames() {
-    if (!isLiveNowPage() || state.namesPromise || !window.ApiClient?.getLiveTvChannels) return;
-    if (Date.now() - state.lastNameAttempt < 10000) return;
-    state.lastNameAttempt = Date.now();
-    state.namesPromise = Promise.resolve()
-      .then(() => window.ApiClient.getLiveTvChannels({ IsFavorite: true, Limit: 1000 }))
-      .then(result => {
-        if (!isLiveNowPage()) return;
-        for (const item of result.Items || []) {
-          if (item.Id && item.Name) state.channelNames.set(item.Id.toLowerCase(), item.Name);
-        }
-        // Inizia una nuova sincronizzazione, anche se i riquadri erano
-        // già stati creati quando i nomi non erano ancora disponibili.
-        state.lastHeartbeat = 0;
-        state.lastPoll = 0;
-        for (const [id, data] of state.cards) {
-          if (data.badge.isConnected) {
-            data.badge.textContent = state.channelNames.get(id) || 'Canale TV';
-          }
-        }
-        tick();
-      })
-      .catch(error => console.warn('[Jellyfin Async Preview] Nomi canali non disponibili:', error))
-      .finally(() => { state.namesPromise = null; });
+    const latestFrame = state.latestFrames.get(name);
+    if (latestFrame && !data.image) drawFrame(data, latestFrame);
   }
 
   function scanCards() {
@@ -239,144 +197,164 @@
       found.set(id, card);
       ensureCard(card, id);
     }
-    for (const id of state.cards.keys()) {
+    for (const [id, data] of state.cards) {
       if (!found.has(id)) {
+        if (data.objectUrl) URL.revokeObjectURL(data.objectUrl);
         state.cards.delete(id);
-        state.displayedVersions.delete(id);
       }
     }
   }
 
-  async function heartbeat() {
-    const names = [...state.cards.keys()]
-      .map(id => state.channelNames.get(id)).filter(Boolean);
-    if (!names.length) return;
-    try {
-      const response = await fetch(previewBase + '/channels', {
-        method: 'POST', mode: 'cors', cache: 'no-store',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ names })
-      });
-      if (!response.ok) throw new Error('HTTP ' + response.status);
-    } catch (error) {
-      console.warn('[Jellyfin Async Preview] Servizio 8099:', error.message);
+  function drawFrame(data, jpeg) {
+    if (!data.host.isConnected) return;
+    if (!data.image) {
+      const overlay = document.createElement('div');
+      overlay.className = 'tvf-ora-auto-frame';
+      overlay.style.cssText = 'position:absolute;inset:0;z-index:6;pointer-events:none;background:#08090c;display:flex;align-items:center;justify-content:center;overflow:hidden;';
+      const image = document.createElement('img');
+      image.alt = 'Fotogramma della diretta';
+      image.style.cssText = 'width:100%;height:100%;object-fit:contain;display:block;';
+      overlay.append(image);
+      data.host.insertBefore(overlay, data.badge);
+      data.image = image;
+    }
+    const objectUrl = URL.createObjectURL(new Blob([jpeg], {type: 'image/jpeg'}));
+    const oldUrl = data.objectUrl;
+    data.objectUrl = objectUrl;
+    data.image.onload = data.image.onerror = () => {
+      if (oldUrl) URL.revokeObjectURL(oldUrl);
+    };
+    data.image.src = objectUrl;
+  }
+
+  function showFrame(name, jpeg) {
+    // Un solo ultimo frame per canale: serve a ripristinare le schede Jellyfin
+    // ricreate dinamicamente o arrivate dopo la trasmissione WebSocket.
+    state.latestFrames.set(name, Uint8Array.from(jpeg));
+    for (const [id, data] of state.cards) {
+      if (state.channelNames.get(id) !== name || !data.host.isConnected) continue;
+      drawFrame(data, jpeg);
     }
   }
 
-  async function pollFrames() {
-    try {
-      const response = await fetch(previewBase + '/state', { mode: 'cors', cache: 'no-store' });
-      if (!response.ok) return;
-      const payload = await response.json();
+  function subscribedNames() {
+    // Il client registra la lista COMPLETA dei Preferiti Jellyfin.
+    // Non dipende dalle schede visibili: i ridisegni di Jellyfin non devono
+    // cancellare temporaneamente le sottoscrizioni e fermare i processi canale.
+    return JSON.stringify([...state.favoriteNames].sort());
+  }
 
-      for (const [name, version] of Object.entries(payload.frames || {})) {
-        for (const [id, knownName] of state.channelNames) {
-          if (knownName !== name || !state.cards.has(id)) continue;
-          state.frameVersions.set(id, version);
-          // Prima immagine automatica. Aggiornamenti successivi SOLO con mouse sopra.
-          if (!state.displayedVersions.has(id) || state.focusedId === id) showFrame(id, version);
+  function sendSubscription() {
+    if (!state.socket || state.socket.readyState !== WebSocket.OPEN || !state.namesReady) return;
+    const names = subscribedNames();
+    if (state.socketNames === names) return;
+    state.socket.send(JSON.stringify({type: 'subscribe', client_id: clientId, names: JSON.parse(names)}));
+    state.socketNames = names;
+  }
+
+  function disconnectClient() {
+    const socket = state.socket;
+    state.socket = null;
+    state.socketNames = '';
+    if (socket && socket.readyState !== WebSocket.CLOSED) socket.close();
+    clearTimeout(state.ledTimer);
+    setLed('#777');
+  }
+
+  function connectClient() {
+    if (state.socket || !state.namesReady || !isLiveNowPage() || document.hidden) return;
+    if (Date.now() - state.lastReconnect < 2500) return;
+    state.lastReconnect = Date.now();
+    const socket = new WebSocket(previewSocket);
+    socket.binaryType = 'arraybuffer';
+    state.socket = socket;
+    socket.onopen = () => {
+      if (state.socket !== socket) return;
+      setLed('#777');
+      sendSubscription();
+    };
+    socket.onmessage = event => {
+      if (state.socket !== socket || !isLiveNowPage() || document.hidden) return;
+      if (typeof event.data === 'string') return;
+      const bytes = new Uint8Array(event.data);
+      const terminator = bytes.indexOf(0);
+      if (terminator < 1 || terminator > 300) return;
+      const name = new TextDecoder().decode(bytes.subarray(0, terminator));
+      if (!state.favoriteNames.has(name)) return;
+      showFrame(name, bytes.subarray(terminator + 1));
+      blink();
+    };
+    socket.onerror = () => setLed('#a85b5b');
+    socket.onclose = () => {
+      clearTimeout(state.ledTimer);
+      if (state.socket === socket) {
+        state.socket = null;
+        state.socketNames = '';
+        setLed('#a85b5b');
+      }
+    };
+  }
+
+  function refreshChannelNames() {
+    if (!isLiveNowPage() || state.namesPromise || !window.ApiClient?.getLiveTvChannels) return;
+    if (Date.now() - state.lastNameAttempt < 30000) return;
+    state.lastNameAttempt = Date.now();
+    state.namesPromise = Promise.resolve()
+      .then(() => window.ApiClient.getLiveTvChannels({IsFavorite: true, Limit: 1000}))
+      .then(result => {
+        if (!isLiveNowPage()) return;
+        const channelNames = new Map();
+        const favoriteNames = new Set();
+        for (const item of result.Items || []) {
+          if (item.Id && item.Name) {
+            channelNames.set(item.Id.toLowerCase(), item.Name);
+            favoriteNames.add(item.Name);
+          }
         }
-      }
-    } catch { /* Mantieni l'immagine originale se il servizio non risponde. */ }
+        state.channelNames = channelNames;
+        state.favoriteNames = favoriteNames;
+        state.namesReady = true;
+        for (const [id, data] of state.cards) {
+          if (data.badge.isConnected) {
+            data.badge.textContent = channelNames.get(id) || 'Canale TV';
+            const latestFrame = state.latestFrames.get(channelNames.get(id));
+            if (latestFrame && !data.image) drawFrame(data, latestFrame);
+          }
+        }
+        sendSubscription();
+        connectClient();
+      })
+      .catch(error => console.warn('[ZAPPING] Preferiti Jellyfin:', error))
+      .finally(() => { state.namesPromise = null; });
   }
-
-  async function notifyFocus(name) {
-    if (state.lastFocusSent === name) return;
-    state.lastFocusSent = name;
-    try {
-      await fetch(previewBase + '/focus', {
-        method: 'POST', mode: 'cors', cache: 'no-store',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name })
-      });
-    } catch { /* Le miniature gia acquisite rimangono visibili. */ }
-  }
-
-  function selectCard(id) {
-    clearTimeout(state.hoverTimer);
-    if (!id || !state.cards.has(id)) {
-      state.focusedId = '';
-      notifyFocus('');
-      return;
-    }
-    state.hoverTimer = setTimeout(() => {
-      state.focusedId = id;
-      notifyFocus(state.channelNames.get(id) || '');
-      const version = state.frameVersions.get(id);
-      if (version) showFrame(id, version);
-    }, 500);
-  }
-
-  document.addEventListener('pointerover', event => {
-    if (event.pointerType === 'touch' || !isLiveNowPage()) return;
-    const card = event.target instanceof Element ? event.target.closest(cardSelectors) : null;
-    if (!card) return;
-    const id = getChannelId(card);
-    if (id && (state.focusedId !== id)) selectCard(id);
-  }, { capture: true, passive: true });
-  document.addEventListener('pointerout', event => {
-    if (event.pointerType === 'touch') return;
-    const card = event.target instanceof Element ? event.target.closest(cardSelectors) : null;
-    if (!card || card.contains(event.relatedTarget)) return;
-    const id = getChannelId(card);
-    if (id && (state.focusedId === id || state.hoverTimer)) selectCard('');
-  }, { capture: true, passive: true });
 
   function tick() {
-    if (state.busy) return;
-    state.busy = true;
-    try {
-      ensureFrameIndicator();
-      updateFrameRate();
-      if (!isLiveNowPage() || document.hidden) {
-        state.running = false;
-        state.focusedId = '';
-        clearTimeout(state.hoverTimer);
-        if (state.lastFocusSent) notifyFocus('');
-        state.cards.clear();
-        return;
-      }
-      if (!state.running) {
-        state.running = true;
-        state.lastHeartbeat = 0;
-        state.lastPoll = 0;
-        state.lastStatus = 0;
-      }
-      // Prima individua i riquadri già presenti: niente await di rete.
-      scanCards();
-      if (!state.channelNames.size) refreshChannelNames();
-      // Le tre operazioni sono indipendenti: una risposta lenta non blocca
-      // né la scansione successiva né l'aggiornamento delle altre due.
-      if (Date.now() - state.lastHeartbeat > 5000) {
-        state.lastHeartbeat = Date.now();
-        void heartbeat();
-      }
-      if (Date.now() - state.lastStatus > 1000) {
-        state.lastStatus = Date.now();
-        void pollServerStats();
-      }
-      if (Date.now() - state.lastPoll > 1200) {
-        state.lastPoll = Date.now();
-        void pollFrames();
-      }
-    } finally { state.busy = false; }
+    ensureFrameIndicator();
+    ensureServerMenu();
+    if (!isLiveNowPage() || document.hidden) {
+      if (state.running) disconnectClient();
+      state.running = false;
+      return;
+    }
+    state.running = true;
+    scanCards();
+    sendSubscription();
+    refreshChannelNames();
+    connectClient();
   }
 
+  window.addEventListener('pagehide', disconnectClient);
   window.addEventListener('hashchange', () => {
+    disconnectClient();
     state.running = false;
-    state.focusedId = '';
-    if (state.lastFocusSent) notifyFocus('');
-    state.lastHeartbeat = 0;
-    state.lastPoll = 0;
-    state.lastStatus = 0;
+    state.namesReady = false;
+    state.lastNameAttempt = 0;
   });
-  // Il primo caricamento SPA puo arrivare dopo il primo tick.
-  // L'osservatore attiva la scansione appena compaiono le schede.
   let scanTimer = null;
   new MutationObserver(() => {
     if (scanTimer || !isLiveNowPage()) return;
     scanTimer = setTimeout(() => { scanTimer = null; tick(); }, 220);
-  }).observe(document.body, { childList: true, subtree: true });
+  }).observe(document.body, {childList: true, subtree: true});
   setInterval(tick, 800);
   tick();
 })();
